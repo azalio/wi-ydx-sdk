@@ -54,6 +54,6 @@ func main() {
 	fmt.Printf("Version ID: %s\n", payload.VersionId)
 	fmt.Println("Entries:")
 	for _, entry := range payload.Entries {
-		fmt.Printf("  Key: %s, Value: %s\n", entry.Key, entry.Value)
+		fmt.Printf("  Key: %s, Value: %s\n", entry.Key, entry.GetTextValue())
 	}
 }
