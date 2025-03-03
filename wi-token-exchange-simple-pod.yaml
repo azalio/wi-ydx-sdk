@@ -1,0 +1,217 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wlif
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wi-token-exchange-simple
+spec:
+  containers:
+  - name: wi-token-exchange
+    image: golang:1.22
+    command: ["sh", "-c"]
+    args:
+    - |
+      cd /app
+      go run wi-token-exchange-simple.go
+    env:
+    - name: SA_ID
+      value: "aje50f4jo27rmrdheqi0"  # Replace with your IAM SA ID
+    - name: SECRET_ID
+      value: "e6qu40kqcphtrhq3gvu0"  # Replace with your Secret ID
+    volumeMounts:
+    - name: app-code
+      mountPath: /app
+    - name: sa-token
+      mountPath: /var/run/secrets/tokens
+  serviceAccountName: wlif
+  volumes:
+  - name: app-code
+    configMap:
+      name: wi-token-exchange-simple-code
+  - name: sa-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: sa-token
+          expirationSeconds: 7200
+          audience: https://storage.yandexcloud.net/oidc/v1/locations/public/folders/b1g7ur1qjufclrvvbma1/clusters/cat7i0i0sviubbd5ss7o
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wi-token-exchange-simple-code
+data:
+  wi-token-exchange-simple.go: |
+    package main
+    
+    import (
+    	"bytes"
+    	"encoding/base64"
+    	"encoding/json"
+    	"fmt"
+    	"io"
+    	"net/http"
+    	"net/url"
+    	"os"
+    	"strings"
+    )
+    
+    func main() {
+    	// Get environment variables or use defaults
+    	saID := os.Getenv("SA_ID")
+    	secretID := os.Getenv("SECRET_ID")
+    	
+    	if saID == "" || secretID == "" {
+    		fmt.Println("Error: SA_ID and SECRET_ID environment variables must be set")
+    		os.Exit(1)
+    	}
+    	
+    	// Read the JWT token from the mounted file
+    	saToken, err := os.ReadFile("/var/run/secrets/tokens/sa-token")
+    	if err != nil {
+    		fmt.Printf("Error reading SA token: %v\n", err)
+    		os.Exit(1)
+    	}
+    	
+    	// Print JWT token for debugging
+    	fmt.Println("JWT Token (first 50 chars):", string(saToken)[:50]+"...")
+    	
+    	// Decode and print JWT token payload
+    	printJWTPayload(string(saToken))
+    	
+    	// Exchange JWT token for IAM token
+    	iamToken, err := exchangeToken(string(saToken), saID)
+    	if err != nil {
+    		fmt.Printf("Error exchanging token: %v\n", err)
+    		os.Exit(1)
+    	}
+    	
+    	fmt.Println("Successfully obtained IAM token")
+    	
+    	// Get secret from Lockbox
+    	secret, err := getSecret(iamToken, secretID)
+    	if err != nil {
+    		fmt.Printf("Error getting secret: %v\n", err)
+    		os.Exit(1)
+    	}
+    	
+    	// Print the secret data
+    	fmt.Println("Secret data:")
+    	fmt.Println(secret)
+    }
+    
+    // printJWTPayload decodes and prints the payload part of a JWT token
+    func printJWTPayload(tokenString string) {
+    	parts := strings.Split(tokenString, ".")
+    	if len(parts) != 3 {
+    		fmt.Println("Invalid JWT token format")
+    		return
+    	}
+    	
+    	// Decode the payload (second part)
+    	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+    	if err != nil {
+    		fmt.Printf("Error decoding JWT payload: %v\n", err)
+    		return
+    	}
+    	
+    	// Pretty print the JSON
+    	var prettyJSON bytes.Buffer
+    	if err := json.Indent(&prettyJSON, payload, "", "  "); err != nil {
+    		fmt.Printf("Error formatting JWT payload: %v\n", err)
+    		fmt.Println("Raw payload:", string(payload))
+    		return
+    	}
+    	
+    	fmt.Println("JWT Payload:")
+    	fmt.Println(prettyJSON.String())
+    }
+    
+    // exchangeToken exchanges a JWT token for an IAM token
+    func exchangeToken(saToken string, saID string) (string, error) {
+    	data := url.Values{}
+    	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+    	data.Set("requested_token_type", "urn:ietf:params:oauth:token-type:access_token")
+    	data.Set("audience", saID)
+    	data.Set("subject_token", saToken)
+    	data.Set("subject_token_type", "urn:ietf:params:oauth:token-type:id_token")
+    	
+    	// Debug request parameters
+    	fmt.Println("Token Exchange Request Parameters:")
+    	fmt.Println("- grant_type:", data.Get("grant_type"))
+    	fmt.Println("- requested_token_type:", data.Get("requested_token_type"))
+    	fmt.Println("- audience:", data.Get("audience"))
+    	fmt.Println("- subject_token_type:", data.Get("subject_token_type"))
+    	
+    	client := &http.Client{}
+    	req, err := http.NewRequest("POST", "https://auth.yandex.cloud/oauth/token", strings.NewReader(data.Encode()))
+    	if err != nil {
+    		return "", err
+    	}
+    	
+    	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+    	
+    	fmt.Println("Sending request to:", req.URL.String())
+    	resp, err := client.Do(req)
+    	if err != nil {
+    		return "", err
+    	}
+    	defer resp.Body.Close()
+    	
+    	fmt.Println("Response status:", resp.Status)
+    	
+    	if resp.StatusCode != http.StatusOK {
+    		body, _ := io.ReadAll(resp.Body)
+    		fmt.Println("Error response body:", string(body))
+    		return "", fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
+    	}
+    	
+    	var tokenResp struct {
+    		AccessToken string `json:"access_token"`
+    	}
+    	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+    		return "", err
+    	}
+    	
+    	return tokenResp.AccessToken, nil
+    }
+    
+    // getSecret retrieves a secret from Yandex Cloud Lockbox
+    func getSecret(iamToken string, secretID string) (string, error) {
+    	url := fmt.Sprintf("https://payload.lockbox.api.cloud.yandex.net/lockbox/v1/secrets/%s/payload", secretID)
+    	
+    	fmt.Println("Requesting secret from URL:", url)
+    	
+    	client := &http.Client{}
+    	req, err := http.NewRequest("GET", url, nil)
+    	if err != nil {
+    		return "", err
+    	}
+    	
+    	req.Header.Add("Authorization", "Bearer "+iamToken)
+    	
+    	resp, err := client.Do(req)
+    	if err != nil {
+    		return "", err
+    	}
+    	defer resp.Body.Close()
+    	
+    	fmt.Println("Secret response status:", resp.Status)
+    	
+    	if resp.StatusCode != http.StatusOK {
+    		body, _ := io.ReadAll(resp.Body)
+    		fmt.Println("Error response body:", string(body))
+    		return "", fmt.Errorf("getting secret failed with status %d: %s", resp.StatusCode, string(body))
+    	}
+    	
+    	body, err := io.ReadAll(resp.Body)
+    	if err != nil {
+    		return "", err
+    	}
+    	
+    	return string(body), nil
+    }
+
